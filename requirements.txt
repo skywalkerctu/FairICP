@@ -3,11 +3,12 @@ pandas
 matplotlib
 IPython
 torch
-sklearn
+scikit-learn
 jupyter
 notebook
 tensorflow
 tensorflow_probability
-re
+# re
 rpy2
-itertools
+# itertools
+seaborn
