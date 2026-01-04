@@ -103,7 +103,7 @@ def inner_func_test(n, dataset, dim, folder_name):
                                                                 num_classes = 2,
                                                                 A_shape = A.shape[1]
                                                                 )
-                    model.fit(input_data_train, Y, check_period = epochs_list)
+                    model.fit(input_data_train, Y, epochs_list = epochs_list)
     
                     for i, cp in enumerate(model.checkpoint_list):
                         model.model = model.cp_model_list[i]
@@ -229,7 +229,7 @@ def inner_func_validate(fold_index, train_indices, test_indices, X_, A_, Y_, dat
                                                                 num_classes = 2,
                                                                 A_shape = A.shape[1]
                                                                 )
-                    model.fit(input_data_train, Y, check_period = epochs_list)
+                    model.fit(input_data_train, Y, epochs_list = epochs_list)
     
                     for i, cp in enumerate(model.checkpoint_list):
                         model.model = model.cp_model_list[i]
