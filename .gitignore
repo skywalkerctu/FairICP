@@ -3,4 +3,4 @@ __pycache__/
 *.SLURMout
 .vscode/
 *.script
-*.csv
+real_experiments/*/*/
