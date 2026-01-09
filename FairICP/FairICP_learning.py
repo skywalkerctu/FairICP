@@ -25,6 +25,32 @@ class PandasDataSet(TensorDataset):
         if isinstance(df, pd.Series):
             df = df.to_frame('dummy')
         return torch.from_numpy(df.values).float()
+    
+def kpc_stat_from_arrays(Yhat_prob: np.ndarray, Y: np.ndarray, A: np.ndarray, knn: int = 1) -> float:
+    """
+    Compute the KPCgraph statistic used in adult_FairICP.py (statistic only; no permutation p-value).
+    Yhat_prob: (n, C) predicted probabilities
+    Y: (n,) labels (0/1)
+    A: (n, dA) sensitive attrs (raw, as in adult_FairICP.py)
+    """
+    # Import lazily so existing workflows without rpy2 don't break unless used
+    import rpy2.robjects as robjects
+    from rpy2.robjects.vectors import FloatVector
+    from rpy2.robjects.packages import importr
+
+    KPC = importr("KPC")
+    stat = KPC.KPCgraph
+
+    rYhat = robjects.r.matrix(FloatVector(Yhat_prob.T.flatten()),
+                              nrow=Yhat_prob.shape[0], ncol=Yhat_prob.shape[1])
+    rZ = robjects.r.matrix(FloatVector(A.T.flatten()),
+                           nrow=A.shape[0], ncol=A.shape[1])
+    rY = robjects.r.matrix(FloatVector(Y.astype(float)),
+                           nrow=A.shape[0], ncol=1)
+
+    res = stat(Y=rYhat, X=rY, Z=rZ, Knn=knn)[0]
+    return float(res)
+
 
 ##############################################################
 ##################### Classification Part ####################
@@ -89,7 +115,20 @@ class EquiClassLearner:
                  model_type,
                  lambda_vec,
                  num_classes,
-                 A_shape):
+                 A_shape,
+                # --- new (optional) ---
+                 adaptive_mu: bool = False,
+                 mu0: float = 1.0,
+                 mu_min: float = 0.0,
+                 mu_max: float = 20.0,
+                 eta_mu: float = 0.1,
+                 ema_beta: float = 0.1,
+                 kpc_M: int = 2048,
+                 kpc_K: int = 4,
+                 lambda_stab: float = 1.0,
+                 kpc_knn: int = 1,
+                 mu_update_freq: int = 1
+):
 
         self.lr_loss = lr_loss
         self.lr_dis = lr_dis
@@ -97,6 +136,27 @@ class EquiClassLearner:
         self.in_shape = in_shape
         self.num_classes = num_classes
         self.A_shape = A_shape
+
+        self.adaptive_mu = adaptive_mu
+        self.mu = float(mu0)
+        self.mu_min = float(mu_min)
+        self.mu_max = float(mu_max)
+        self.eta_mu = float(eta_mu)
+        self.ema_beta = float(ema_beta)
+        self.kpc_M = int(kpc_M)
+        self.kpc_K = int(kpc_K)
+        self.lambda_stab = float(lambda_stab)
+        self.kpc_knn = int(kpc_knn)
+        self.mu_update_freq = int(mu_update_freq)
+
+        self.J_ema = None
+        self.mu_history = []  # list of dicts per epoch
+
+        if self.adaptive_mu:
+            # hybrid mapping: lambda = mu/(1+mu)
+            lam = self.mu / (1.0 + self.mu)
+            self.lambdas = torch.Tensor([lam])
+
 
         self.model_type = model_type
         if self.model_type == "deep_model":
@@ -167,7 +227,64 @@ class EquiClassLearner:
                                                     self.dis_steps,
                                                     self.loss_steps,
                                                     self.num_classes)
-           
+            
+            if self.adaptive_mu and (epoch % self.mu_update_freq == 0):
+                # --- compute KPC level + stability on K subsamples ---
+                n = X_train.shape[0]
+                K = max(2, self.kpc_K)
+                M = min(self.kpc_M, n - (n % K))
+                if M < K * 10:  # safety: too small for stable KPC
+                    M = min(n - (n % K), K * 10)
+
+                idx = np.random.choice(n, size=M, replace=False)
+                np.random.shuffle(idx)
+                chunks = np.array_split(idx, K)
+
+                # device-safe forward pass
+                device = next(self.model.parameters()).device
+
+                F_list = []
+                self.model.eval()
+                with torch.no_grad():
+                    for c in chunks:
+                        # scaled features for forward pass
+                        X_sub = torch.from_numpy(X_train.iloc[c].values).float().to(device)
+                        logits = self.model(X_sub)
+                        probs = F.softmax(logits, dim=1).detach().cpu().numpy()
+
+                        Y_sub = Y[c]                  # raw labels
+                        A_sub = orig_Z[c, :]          # raw sensitive attrs (match evaluation)
+
+                        F_list.append(kpc_stat_from_arrays(probs, Y_sub, A_sub, knn=self.kpc_knn))
+                self.model.train()
+
+                level = float(np.mean([max(F, 0.0) for F in F_list]))
+                stab = float(np.std([max(F, 0.0) for F in F_list]))
+                J = level + self.lambda_stab * stab
+
+                if self.J_ema is None:
+                    self.J_ema = J
+                else:
+                    self.J_ema = (1.0 - self.ema_beta) * self.J_ema + self.ema_beta * J
+
+                g = J - self.J_ema
+
+                # update mu then map to lambda
+                self.mu = float(np.clip(self.mu + self.eta_mu * g, self.mu_min, self.mu_max))
+                lam = self.mu / (1.0 + self.mu)
+                self.lambdas = torch.Tensor([lam]).to(device)
+
+                self.mu_history.append({
+                    "epoch": epoch,
+                    "mu": self.mu,
+                    "lambda": float(lam),
+                    "kpc_level": level,
+                    "kpc_stab": stab,
+                    "J": float(J),
+                    "J_ema": float(self.J_ema),
+                    "g": float(g),
+                })
+
             if epoch in epochs_list:
                 self.checkpoint_list.append(epoch)
                 cp_model = copy.deepcopy(self.model)

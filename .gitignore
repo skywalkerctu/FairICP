@@ -1,1 +1,6 @@
 __pycache__/
+*.err
+*.SLURMout
+.vscode/
+*.script
+*.csv
